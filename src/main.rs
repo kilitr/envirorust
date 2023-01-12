@@ -1,15 +1,11 @@
 use core::time;
-use std::thread;
+use std::{env, thread};
 
 use dotenv::dotenv;
 
 use bme280::{Measurements, BME280};
 use ltr_559::{AlsGain, AlsIntTime, AlsMeasRate, Ltr559, SlaveAddr};
 use rppal::{hal, i2c::I2c};
-
-use futures::prelude::*;
-use influxdb2::models::DataPoint;
-use influxdb2::Client;
 
 fn bme_measurements() -> Measurements<rppal::i2c::Error> {
     let i2c_bus = I2c::new().expect("Error during i2c initialization");
@@ -30,6 +26,10 @@ fn ltr_measurements() -> f32 {
     value
 }
 
+trait LineProtocol {
+    fn as_line_protocol(&self, measurement: &str, hostname: &str) -> String;
+}
+
 struct RoomClimateReading {
     temperature: f64,
     humidity: f64,
@@ -37,34 +37,48 @@ struct RoomClimateReading {
     light: f64,
 }
 
-async fn write_measurement(cr: RoomClimateReading) -> Result<(), Box<dyn std::error::Error>> {
-    let host = std::env::var("INFLUXDB_HOST").unwrap();
-    let org = std::env::var("INFLUXDB_ORG").unwrap();
-    let token = std::env::var("INFLUXDB_TOKEN").unwrap();
-    let bucket = std::env::var("INFLUXDB_BUCKET").unwrap();
-    let client = Client::new(host, org, token);
-
-    let points = vec![DataPoint::builder("room")
-        .tag("room", "Kilian")
-        .field("temperature", cr.temperature)
-        .field("humidity", cr.humidity)
-        .field("pressure", cr.pressure)
-        .field("light", cr.light)
-        .build()?];
-    client.write(bucket.as_str(), stream::iter(points)).await?;
-    Ok(())
+impl LineProtocol for RoomClimateReading {
+    fn as_line_protocol(&self, measurement: &str, hostname: &str) -> String {
+        format!(
+            "{measurement},hostname={hostname} temperature={},humidity={},pressure={},light={}",
+            self.temperature, self.humidity, self.pressure, self.light
+        )
+    }
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn get_env(env_name: &str) -> String {
+    env::var(env_name).expect(&format!(
+        "You need to provide {env_name} as environment variable!"
+    ))
+}
+
+fn write_measurement(cr: RoomClimateReading) {
+    let client = reqwest::blocking::Client::new();
+    let url = format!(
+        "{}/api/v2/write?org=influxdata&bucket=default",
+        get_env("INFLUX_URL")
+    );
+    let authorization_token = get_env("INFLUX_AUTH_TOKEN");
+
+    let body_value = cr.as_line_protocol("thpl", "pizero");
+    println!("{body_value}");
+
+    let resp = client
+        .post(url)
+        .bearer_auth(authorization_token)
+        .header("Content-Type", "text/plain")
+        .body(body_value)
+        .send()
+        .unwrap();
+
+    println!("Statuscode: {}", resp.status());
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenv().ok();
     loop {
         let thp = bme_measurements();
         let light = ltr_measurements();
-
-        println!(
-            "{}°C {}% {}pascal {}lux",
-            thp.temperature, thp.humidity, thp.pressure, light
-        );
 
         let room_reading = RoomClimateReading {
             temperature: thp.temperature.into(),
@@ -73,13 +87,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             light: light.into(),
         };
 
-        tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap()
-            .block_on(write_measurement(room_reading))
-            .unwrap();
-
+        write_measurement(room_reading);
         thread::sleep(time::Duration::from_secs(30));
     }
 }
