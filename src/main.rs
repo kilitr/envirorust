@@ -7,6 +7,8 @@ use bme280::{Measurements, BME280};
 use ltr_559::{AlsGain, AlsIntTime, AlsMeasRate, Ltr559, SlaveAddr};
 use rppal::{hal, i2c::I2c};
 
+use influxdb_line_protocol::{DataPoint, FieldValue};
+
 fn bme_measurements() -> Measurements<rppal::i2c::Error> {
     let i2c_bus = I2c::new().expect("Error during i2c initialization");
     let mut bme280 = BME280::new_primary(i2c_bus, hal::Delay::new());
@@ -26,33 +28,13 @@ fn ltr_measurements() -> f32 {
     value
 }
 
-trait LineProtocol {
-    fn as_line_protocol(&self, measurement: &str, hostname: &str) -> String;
-}
-
-struct RoomClimateReading {
-    temperature: f64,
-    humidity: f64,
-    pressure: f64,
-    light: f64,
-}
-
-impl LineProtocol for RoomClimateReading {
-    fn as_line_protocol(&self, measurement: &str, hostname: &str) -> String {
-        format!(
-            "{measurement},hostname={hostname} temperature={},humidity={},pressure={},light={}",
-            self.temperature, self.humidity, self.pressure, self.light
-        )
-    }
-}
-
 fn get_env(env_name: &str) -> String {
     env::var(env_name).expect(&format!(
         "You need to provide {env_name} as environment variable!"
     ))
 }
 
-fn write_measurement(cr: RoomClimateReading) {
+fn send(datapoint_str: String) {
     let client = reqwest::blocking::Client::new();
     let url = format!(
         "{}/api/v2/write?org=influxdata&bucket=default",
@@ -60,14 +42,11 @@ fn write_measurement(cr: RoomClimateReading) {
     );
     let authorization_token = get_env("INFLUX_AUTH_TOKEN");
 
-    let body_value = cr.as_line_protocol("thpl", "pizero");
-    println!("{body_value}");
-
     let resp = client
         .post(url)
         .bearer_auth(authorization_token)
         .header("Content-Type", "text/plain")
-        .body(body_value)
+        .body(datapoint_str)
         .send()
         .unwrap();
 
@@ -76,18 +55,24 @@ fn write_measurement(cr: RoomClimateReading) {
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenv().ok();
+    let hostname = sys_info::hostname().unwrap();
     loop {
         let thp = bme_measurements();
         let light = ltr_measurements();
 
-        let room_reading = RoomClimateReading {
-            temperature: thp.temperature.into(),
-            humidity: thp.humidity.into(),
-            pressure: thp.pressure.into(),
-            light: light.into(),
+        let datapoint = DataPoint {
+            measurement: "thpl",
+            tag_set: vec![("hostname", hostname.as_str())],
+            field_set: vec![
+                ("temperature", FieldValue::Float(thp.temperature.into())),
+                ("pressure", FieldValue::Float(thp.pressure.into())),
+                ("humidity", FieldValue::Float(thp.humidity.into())),
+                ("light", FieldValue::Float(light.into())),
+            ],
+            timestamp: None,
         };
 
-        write_measurement(room_reading);
+        send(datapoint.into_string().unwrap());
         thread::sleep(time::Duration::from_secs(30));
     }
 }
