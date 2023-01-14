@@ -1,6 +1,7 @@
 use core::time;
 use std::{env, thread};
 
+use chrono::Local;
 use dotenv::dotenv;
 
 use bme280::{Measurements, BME280};
@@ -34,7 +35,7 @@ fn get_env(env_name: &str) -> String {
     ))
 }
 
-fn send(datapoint_str: String) {
+fn send(datapoint_str: &String) -> reqwest::blocking::Response {
     let client = reqwest::blocking::Client::new();
     let url = format!(
         "{}/api/v2/write?org=influxdata&bucket=default",
@@ -46,17 +47,18 @@ fn send(datapoint_str: String) {
         .post(url)
         .bearer_auth(authorization_token)
         .header("Content-Type", "text/plain")
-        .body(datapoint_str)
+        .body(datapoint_str.clone())
         .send()
         .unwrap();
 
-    println!("Statuscode: {}", resp.status());
+    resp
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     dotenv().ok();
     let hostname = sys_info::hostname().unwrap();
     loop {
+        let now = Local::now();
         let thp = bme_measurements();
         let light = ltr_measurements();
 
@@ -71,8 +73,11 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             ],
             timestamp: None,
         };
+        let dp_string = datapoint.into_string().unwrap();
+        let resp = send(&dp_string);
 
-        send(datapoint.into_string().unwrap());
+        println!("[{}] {} - {}", now, resp.status(), dp_string);
+
         thread::sleep(time::Duration::from_secs(30));
     }
 }
